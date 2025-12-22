@@ -76,7 +76,7 @@
               <div class="statistics-note">
                 <el-tooltip
                   effect="dark"
-                  content="精确计算采用GPT官方分词器tokenizer-GPT 4o，不适用于Claude。考虑到聊天内容还包含文件、图片等无法被提取的内容，token计算结果仅供参考。"
+                  content="精确计算采用GPT官方分词器tokenizer-GPT 4o/5，不适用于Claude。考虑到聊天内容还包含文件、图片等无法被提取的内容，token计算结果仅供参考。"
                   placement="bottom"
                 >
                   <el-icon><InfoFilled /></el-icon>
@@ -221,7 +221,7 @@ marked.setOptions({
 });
 
 export default {
-  name: 'App',
+  name: 'ProcessChat',
   components: {
     ChatDotRound,
     Upload,
@@ -449,6 +449,55 @@ export default {
       return dialogues;
     }
 
+    function extractDialogueFromGemini(data) {
+      const dialogues = [];
+      
+      // 检查是否存在 chunkedPrompt.chunks
+      if (!data.chunkedPrompt || !Array.isArray(data.chunkedPrompt.chunks)) {
+        return dialogues;
+      }
+      
+      const chunks = data.chunkedPrompt.chunks;
+      let pendingThinking = null; // 用于存储待附加的思考内容
+      
+      for (let i = 0; i < chunks.length; i++) {
+        const chunk = chunks[i];
+        if (!chunk.text || !chunk.role) continue;
+        
+        const role = chunk.role === 'user' ? 'user' : 'assistant';
+        const text = chunk.text.trim();
+        const timestamp = chunk.timestamp ? formatTimestamp(chunk.timestamp) : '';
+        
+        if (!text) continue;
+        
+        // 如果是 model 且 isThought 为 true
+        if (chunk.role === 'model' && chunk.isThought === true) {
+          pendingThinking = {
+            text: text,
+            timestamp: timestamp
+          };
+          continue; // 先不添加，等待下一条 model 消息
+        }
+        
+        // 如果是 model 且不是思考内容，检查是否有待附加的思考
+        if (chunk.role === 'model' && pendingThinking) {
+          // 先添加思考内容（带特殊标记）
+          dialogues.push(`【assistant:thinking】${pendingThinking.timestamp ? ` [${pendingThinking.timestamp}]` : ''} <thinking>${pendingThinking.text}</thinking>`);
+          pendingThinking = null; // 清空
+        }
+        
+        // 添加当前消息
+        dialogues.push(`【${role}】${timestamp ? ` [${timestamp}]` : ''} ${text}`);
+      }
+      
+      // 如果最后还有未处理的思考内容
+      if (pendingThinking) {
+        dialogues.push(`【assistant:thinking】${pendingThinking.timestamp ? ` [${pendingThinking.timestamp}]` : ''} <thinking>${pendingThinking.text}</thinking>`);
+      }
+      
+      return dialogues;
+    }
+
     // 添加时间戳转换函数
     function formatTimestamp(timestamp) {
       try {
@@ -485,13 +534,36 @@ export default {
       }
     }
 
-    function processRawJson(data) {
+    function processRawJson(data, originalFilename = null) {
       const outputs = [];
       
       // 检查是否为数组格式
       if (Array.isArray(data)) {
         const counter = {};
         for (const item of data) {
+          // 检查是否为Gemini格式
+          if (item.chunkedPrompt !== undefined && item.chunkedPrompt.chunks !== undefined) {
+            // 优先使用上传的文件名，其次是 item 中的 title/name
+            let title = "Gemini Chat";
+            if (originalFilename) {
+              // 移除文件扩展名
+              title = originalFilename.replace(/\.[^/.]+$/, '');
+            } else if (item.title || item.name) {
+              title = item.title || item.name;
+            }
+            
+            const dialogues = extractDialogueFromGemini(item);
+            
+            if (dialogues.length) {
+              const base = sanitizeFilename(title);
+              const count = (counter[base] || 0) + 1;
+              counter[base] = count;
+              const fn = count > 1 ? `${base}_${count}.txt` : `${base}.txt`;
+              outputs.push({ filename: fn, content: dialogues.join("\n") });
+            }
+            continue;
+          }
+          
           // 检查是否为Claude格式
           if (item.name !== undefined && item.chat_messages !== undefined) {
             const name = item.name || "Undefined";
@@ -577,8 +649,28 @@ export default {
         return outputs;
       }
       
-      // ChatGPT对象格式处理
+      // 单个对话格式检查 - Gemini
       if (typeof data === "object" && !Array.isArray(data)) {
+        // 检查是否为单个Gemini对话
+        if (data.chunkedPrompt !== undefined && data.chunkedPrompt.chunks !== undefined) {
+          // 优先使用上传的文件名
+          let title = "Gemini Chat";
+          if (originalFilename) {
+            title = originalFilename.replace(/\.[^/.]+$/, '');
+          } else if (data.title || data.name) {
+            title = data.title || data.name;
+          }
+          
+          const dialogues = extractDialogueFromGemini(data);
+          
+          if (dialogues.length) {
+            const fn = sanitizeFilename(title) + ".txt";
+            outputs.push({ filename: fn, content: dialogues.join("\n") });
+            return outputs;
+          }
+        }
+        
+        // ChatGPT对象格式处理
         for (const title in data) {
           const content = data[title];
           // 添加空值检查
@@ -643,7 +735,7 @@ export default {
       reader.onload = function (e) {
         try {
           const data = JSON.parse(e.target.result);
-          const outputs = processRawJson(data);
+          const outputs = processRawJson(data, file.name);
           lastOutputs.value = outputs;
           filteredOutputs.value = outputs;
           // 初始化选择状态
@@ -711,8 +803,8 @@ export default {
     const chatLines = computed(() => {
       if (!currentFile.value?.content) return [];
       
-      // 只匹配特定的角色标记
-      const rolePattern = /【(model_message|user_message|assistant|user)】/;
+      // 只匹配特定的角色标记（包含 assistant:thinking）
+      const rolePattern = /【(model_message|user_message|assistant:thinking|assistant|user)】/;
       const lines = currentFile.value.content.split('\n');
       const messages = [];
       let currentMessage = '';
@@ -739,40 +831,91 @@ export default {
         messages.push(`【${currentRole}】${currentMessage}`);
       }
 
-      return messages.filter(msg => {
+      // 过滤空消息
+      const filteredMessages = messages.filter(msg => {
         const content = msg.replace(/^【.*?】\s*/, '').trim();
         return content.length > 0;
       });
+
+      // 合并思考内容到下一条 assistant 消息
+      const mergedMessages = [];
+      let pendingThinking = null;
+
+      for (let i = 0; i < filteredMessages.length; i++) {
+        const msg = filteredMessages[i];
+        
+        if (msg.startsWith('【assistant:thinking】')) {
+          // 保存思考内容，等待下一条 assistant 消息
+          pendingThinking = msg;
+        } else if ((msg.startsWith('【assistant】') || msg.startsWith('【model_message】')) && pendingThinking) {
+          // 将思考内容附加到当前 assistant 消息前面
+          mergedMessages.push(pendingThinking + '\n' + msg);
+          pendingThinking = null;
+        } else {
+          // 如果有未附加的思考内容，先添加它
+          if (pendingThinking) {
+            mergedMessages.push(pendingThinking);
+            pendingThinking = null;
+          }
+          mergedMessages.push(msg);
+        }
+      }
+
+      // 处理最后可能剩余的思考内容
+      if (pendingThinking) {
+        mergedMessages.push(pendingThinking);
+      }
+
+      return mergedMessages;
     });
 
     function getMessageClass(line) {
-      if (line.startsWith('【assistant】') || line.startsWith('【model_message】')) {
+      if (line.startsWith('【assistant】') || line.startsWith('【model_message】') || line.startsWith('【assistant:thinking】')) {
         return 'message-left';
       }
       return 'message-right';
     }
 
     function isLeftMessage(line) {
-      return line.startsWith('【assistant】') || line.startsWith('【model_message】');
+      return line.startsWith('【assistant】') || line.startsWith('【model_message】') || line.startsWith('【assistant:thinking】');
     }
 
     function getMessageContent(line, lineIndex) {
+      // 检查是否包含思考内容（可能与其他内容在同一消息中）
+      const thinkingPattern = /【assistant:thinking】\s*(\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\])?\s*<thinking>([\s\S]*?)<\/thinking>/;
+      const thinkingMatch = line.match(thinkingPattern);
+      
+      let thinkingHtml = '';
+      let mainContent = line;
+      
+      // 如果有思考内容，先提取并处理
+      if (thinkingMatch) {
+        const thinkingText = thinkingMatch[2].trim();
+        const thinkingContentHtml = marked(thinkingText, { breaks: true });
+        
+        // 创建折叠组件（不包含额外的换行和空格）
+        thinkingHtml = `<details class="thinking-collapsible"><summary class="thinking-summary">💭 思考过程</summary><div class="thinking-content">${thinkingContentHtml}</div></details>`;
+        
+        // 从主内容中移除思考部分
+        mainContent = line.replace(thinkingPattern, '').trim();
+      }
+      
       // 提取时间戳
-      const timestampMatch = line.match(/\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\]/);
+      const timestampMatch = mainContent.match(/\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\]/);
       const timestamp = timestampMatch ? timestampMatch[1] : '';
       
       // 移除角色标记和时间戳
-      let content = line.replace(/^【.*?】\s*/, '').trim();
+      let content = mainContent.replace(/^【.*?】\s*/, '').trim();
       content = content.replace(/\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\]\s*/, '');
       
       // 只在 user_message 类型的消息中移除分割线，且只匹配20个或更多连续的连字符
-      const cleanContent = line.startsWith('【user_message】') 
+      const cleanContent = mainContent.startsWith('【user_message】') 
         ? content.replace(/-{20,}/g, '')
         : content;
         
       // 将全角引号转换为半角
-      const normalizedContent = cleanContent
-        .replace(/['’＇]/g, "'")  // 全角单引号转半角
+      let normalizedContent = cleanContent
+        .replace(/[''＇]/g, "'")  // 全角单引号转半角
         .replace(/["＂]/g, '"')  // 全角双引号转半角
         
       let html = marked(normalizedContent, { breaks: true });
@@ -788,12 +931,17 @@ export default {
         });
       }
       
-      // 添加时间戳到内容前面
+      // 组合内容：时间戳 + 思考内容 + 主内容
+      let finalHtml = '';
       if (timestamp) {
-        html = `<span class="timestamp">${timestamp}</span>${html}`;
+        finalHtml += `<span class="timestamp">${timestamp}</span>`;
       }
+      if (thinkingHtml) {
+        finalHtml += thinkingHtml;
+      }
+      finalHtml += html;
       
-      return html.replace(/\s+$/, '').replace(/\n$/, '');
+      return finalHtml.replace(/\s+$/, '').replace(/\n$/, '');
     }
 
     const statistics = computed(() => {
@@ -845,12 +993,22 @@ export default {
       };
 
       for (const line of lines) {
-        if (line.startsWith('【assistant】') || line.startsWith('【model_message】')) {
-          // 如果之前有内容，先处理之前的内容
+        if (line.startsWith('【assistant:thinking】')) {
+          // 思考内容不计入回复次数，但计入 token 数
           if (currentContent && currentRole) {
             totalTokens += countTokens(currentContent);
             if (currentRole === 'assistant') assistantCount++;
             else userCount++;
+          }
+          currentRole = 'thinking'; // 特殊标记，不计入回复次数
+          currentContent = line.replace(/^【.*?】\s*/, '').trim();
+        } else if (line.startsWith('【assistant】') || line.startsWith('【model_message】')) {
+          // 如果之前有内容，先处理之前的内容
+          if (currentContent && currentRole) {
+            totalTokens += countTokens(currentContent);
+            if (currentRole === 'assistant') assistantCount++;
+            else if (currentRole === 'user') userCount++;
+            // thinking 不计入次数
           }
           currentRole = 'assistant';
           currentContent = line.replace(/^【.*?】\s*/, '').trim();
@@ -859,7 +1017,8 @@ export default {
           if (currentContent && currentRole) {
             totalTokens += countTokens(currentContent);
             if (currentRole === 'assistant') assistantCount++;
-            else userCount++;
+            else if (currentRole === 'user') userCount++;
+            // thinking 不计入次数
           }
           currentRole = 'user';
           currentContent = line.replace(/^【.*?】\s*/, '').trim();
@@ -873,7 +1032,8 @@ export default {
       if (currentContent && currentRole) {
         totalTokens += countTokens(currentContent);
         if (currentRole === 'assistant') assistantCount++;
-        else userCount++;
+        else if (currentRole === 'user') userCount++;
+        // thinking 不计入次数
       }
 
       return {
@@ -1008,7 +1168,8 @@ export default {
               trimmedLine.startsWith('【assistant】') ||
               trimmedLine.startsWith('【user】') ||
               trimmedLine.startsWith('【model_message】') ||
-              trimmedLine.startsWith('【user_message】')
+              trimmedLine.startsWith('【user_message】') ||
+              trimmedLine.startsWith('【assistant:thinking】')
             );
           });
 
@@ -1735,6 +1896,84 @@ button:disabled {
   box-shadow: 0 0 0 2px #7986cb;
 }
 
+/* 思考内容折叠样式 */
+.message-bubble :deep(.thinking-collapsible) {
+  margin: 4px 0 8px 0;
+  border: 1px solid rgba(0, 0, 0, 0.1);
+  border-radius: 8px;
+  overflow: hidden;
+  background-color: rgba(0, 0, 0, 0.02);
+}
+
+.message-bubble :deep(.thinking-summary) {
+  cursor: pointer;
+  padding: 8px 10px;
+  font-weight: 500;
+  font-size: 0.9em;
+  user-select: none;
+  list-style: none;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  transition: background-color 0.2s;
+}
+
+.message-bubble :deep(.thinking-summary::-webkit-details-marker) {
+  display: none;
+}
+
+.message-bubble :deep(.thinking-summary::marker) {
+  display: none;
+}
+
+.message-bubble :deep(.thinking-summary:hover) {
+  background-color: rgba(0, 0, 0, 0.05);
+}
+
+.message-bubble :deep(.thinking-content) {
+  padding: 8px 10px;
+  border-top: 1px solid rgba(0, 0, 0, 0.1);
+  background-color: transparent;
+}
+
+.message-left .message-bubble :deep(.thinking-collapsible) {
+  border-color: #e8eaf6;
+  background-color: #f5f6fa;
+}
+
+.message-left .message-bubble :deep(.thinking-summary) {
+  color: #5c6bc0;
+}
+
+.message-left .message-bubble :deep(.thinking-summary:hover) {
+  background-color: #e8eaf6;
+}
+
+.message-left .message-bubble :deep(.thinking-content) {
+  border-top-color: #e8eaf6;
+  background-color: transparent;
+  color: #5c6bc0;
+}
+
+.message-right .message-bubble :deep(.thinking-collapsible) {
+  border-color: rgba(255, 255, 255, 0.3);
+  background-color: rgba(255, 255, 255, 0.1);
+}
+
+.message-right .message-bubble :deep(.thinking-summary) {
+  color: white;
+}
+
+.message-right .message-bubble :deep(.thinking-summary:hover) {
+  background-color: rgba(255, 255, 255, 0.15);
+}
+
+.message-right .message-bubble :deep(.thinking-content) {
+  border-top-color: rgba(255, 255, 255, 0.3);
+  background-color: transparent;
+  color: white;
+}
+
 /* 移动端适配 */
 @media screen and (max-width: 768px) {
   .container {
@@ -1860,10 +2099,6 @@ button:disabled {
   .message-checkbox input[type="checkbox"] {
     width: 16px;
     height: 16px;
-  }
-
-  .message-container.selected {
-    /* 移除会导致移位的样式 */
   }
 
   .message-checkbox {
