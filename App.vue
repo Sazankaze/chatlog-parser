@@ -6,12 +6,32 @@
         <el-icon><Upload /></el-icon>
         选择 JSON 文件
       </label>
-      <input type="file" id="fileInput" accept=".json" @change="handleFileChange">
+      <input type="file" id="fileInput" accept=".json" multiple @change="handleFileChange">
       <label for="txtFileInput" class="file-input-label" style="margin-left: 12px;">
         <el-icon><Upload /></el-icon>
         上传聊天txt
       </label>
       <input type="file" id="txtFileInput" accept=".txt" multiple @change="handleTxtFileChange">
+      <button 
+        class="clear-button" 
+        @click="clearAllFiles"
+        :disabled="lastOutputs.length === 0"
+        title="清空所有聊天窗口"
+      >
+        <el-icon><Delete /></el-icon>
+        清空窗口
+      </button>
+    </div>
+    
+    <!-- Gemini导出选项 -->
+    <div class="export-options">
+      <label class="option-label">
+        <input 
+          type="checkbox" 
+          v-model="includeThinking"
+        >
+        <span>导出时包含 Gemini 思考过程</span>
+      </label>
     </div>
     
     <!-- 文件列表 -->
@@ -205,7 +225,8 @@ import {
   User,
   Search,
   InfoFilled,
-  Loading
+  Loading,
+  Delete
 } from '@element-plus/icons-vue'
 import { preloadEncoder, calculateTokens } from '@/utils/tokenizerLoader'
 
@@ -234,7 +255,8 @@ export default {
     User,
     Search,
     InfoFilled,
-    Loading
+    Loading,
+    Delete
   },
   setup() {
     const outputContent = ref('聊天记录将在这里显示');
@@ -252,6 +274,7 @@ export default {
     const matchCount = ref(0)
     const currentMatchIndex = ref(0)
     const matchRefs = ref([])
+    const includeThinking = ref(true) // 默认包含思考过程
     
     // 新增：用于跟踪选中的消息
     const selectedMessages = ref([])
@@ -449,7 +472,7 @@ export default {
       return dialogues;
     }
 
-    function extractDialogueFromGemini(data) {
+    function extractDialogueFromGemini(data, includeThinkingProcess = true) {
       const dialogues = [];
       
       // 检查是否存在 chunkedPrompt.chunks
@@ -472,10 +495,12 @@ export default {
         
         // 如果是 model 且 isThought 为 true
         if (chunk.role === 'model' && chunk.isThought === true) {
-          pendingThinking = {
-            text: text,
-            timestamp: timestamp
-          };
+          if (includeThinkingProcess) {
+            pendingThinking = {
+              text: text,
+              timestamp: timestamp
+            };
+          }
           continue; // 先不添加，等待下一条 model 消息
         }
         
@@ -552,7 +577,7 @@ export default {
               title = item.title || item.name;
             }
             
-            const dialogues = extractDialogueFromGemini(item);
+            const dialogues = extractDialogueFromGemini(item, includeThinking.value);
             
             if (dialogues.length) {
               const base = sanitizeFilename(title);
@@ -661,7 +686,7 @@ export default {
             title = data.title || data.name;
           }
           
-          const dialogues = extractDialogueFromGemini(data);
+          const dialogues = extractDialogueFromGemini(data, includeThinking.value);
           
           if (dialogues.length) {
             const fn = sanitizeFilename(title) + ".txt";
@@ -726,34 +751,48 @@ export default {
     }
 
     async function handleFileChange(event) {
-      const file = event.target.files[0];
-      if (!file) return;
+      const files = event.target.files;
+      if (!files || !files.length) return;
       
       status.value = "正在解析文件...";
-      const reader = new FileReader();
+      let newOutputs = [];
+      let successCount = 0;
+      let failCount = 0;
       
-      reader.onload = function (e) {
+      for (const file of files) {
         try {
-          const data = JSON.parse(e.target.result);
+          const text = await file.text();
+          const data = JSON.parse(text);
           const outputs = processRawJson(data, file.name);
-          lastOutputs.value = outputs;
-          filteredOutputs.value = outputs;
-          // 初始化选择状态
-          selectedFiles.value = outputs.map(() => false);
           
           if (outputs.length === 0) {
-            ElMessage.error("解析完成，但未找到对话内容");
-            return;
+            ElMessage.warning(`${file.name} 未找到对话内容`);
+            failCount++;
+            continue;
           }
           
-          status.value = `解析完成，找到 ${outputs.length} 个会话`;
+          newOutputs = [...newOutputs, ...outputs];
+          successCount++;
         } catch (err) {
-          ElMessage.error(err.message || "解析失败");
-          status.value = "解析失败";
+          ElMessage.error(`${file.name} 解析失败: ${err.message || "未知错误"}`);
+          failCount++;
         }
-      };
+      }
       
-      reader.readAsText(file, "utf-8");
+      if (newOutputs.length > 0) {
+        // 合并到现有聊天窗口
+        lastOutputs.value = [...lastOutputs.value, ...newOutputs];
+        filteredOutputs.value = lastOutputs.value;
+        selectedFiles.value = lastOutputs.value.map(() => false);
+        
+        status.value = `成功导入 ${successCount} 个文件，共 ${newOutputs.length} 个会话${failCount > 0 ? `，${failCount} 个文件失败` : ''}`;
+        ElMessage.success(`成功导入 ${newOutputs.length} 个会话`);
+      } else {
+        status.value = "未找到有效的对话内容";
+      }
+      
+      // 清空input，允许重复上传同一文件
+      event.target.value = '';
     }
 
     async function handleDownload() {
@@ -1135,6 +1174,18 @@ export default {
       }
     }
 
+    // 清空所有文件
+    function clearAllFiles() {
+      if (lastOutputs.value.length === 0) return;
+      
+      lastOutputs.value = [];
+      filteredOutputs.value = [];
+      selectedFiles.value = [];
+      searchQuery.value = '';
+      status.value = '已清空所有聊天窗口';
+      ElMessage.success('已清空所有聊天窗口');
+    }
+
     // 新增：处理txt文件上传
     async function handleTxtFileChange(event) {
       const files = event.target.files;
@@ -1190,6 +1241,7 @@ export default {
         filteredOutputs.value = lastOutputs.value;
         selectedFiles.value = lastOutputs.value.map(() => false);
         status.value = `已导入 ${newOutputs.length} 个txt文件`;
+        ElMessage.success(`已导入 ${newOutputs.length} 个txt文件`);
       }
       // 清空input，允许重复上传同一文件
       event.target.value = '';
@@ -1274,7 +1326,9 @@ export default {
       isSelectMode,
       isAllMessagesSelected,
       hasSelectedMessages,
-      selectedMessagesCount
+      selectedMessagesCount,
+      clearAllFiles,
+      includeThinking
     };
   }
 }
@@ -1323,6 +1377,40 @@ h2 {
   text-align: center;
 }
 
+.export-options {
+  margin: 15px 0;
+  text-align: center;
+}
+
+.option-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+  user-select: none;
+  color: #5c6bc0;
+  font-size: 0.95em;
+  padding: 8px 16px;
+  background-color: #f5f6fa;
+  border-radius: 8px;
+  transition: all 0.2s ease;
+}
+
+.option-label:hover {
+  background-color: #e8eaf6;
+}
+
+.option-label input[type="checkbox"] {
+  width: 18px;
+  height: 18px;
+  cursor: pointer;
+  accent-color: #7986cb;
+}
+
+.option-label span {
+  font-weight: 500;
+}
+
 .file-input-label {
   display: inline-flex;
   align-items: center;
@@ -1339,6 +1427,33 @@ h2 {
 .file-input-label:hover {
   background-color: #c5cae9;
   transform: translateY(-2px);
+}
+
+.clear-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 12px 24px;
+  background-color: #ffebee;
+  color: #e53935;
+  border: none;
+  border-radius: 12px;
+  cursor: pointer;
+  transition: all 0.3s ease;
+  font-weight: 500;
+  margin-left: 12px;
+}
+
+.clear-button:hover:not(:disabled) {
+  background-color: #ffcdd2;
+  transform: translateY(-2px);
+}
+
+.clear-button:disabled {
+  background-color: #fafafa;
+  color: #bdbdbd;
+  cursor: not-allowed;
+  transform: none;
 }
 
 input[type="file"] {
